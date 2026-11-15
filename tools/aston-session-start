@@ -1,0 +1,20 @@
+#!/bin/sh
+# Start the session for the phone's panel.
+#   game     Gaming Mode: Gamescope with the Steam interface
+#   desktop  Desktop Mode: KDE Plasma
+# The standing choice is /etc/aston/session. Steam's own "Switch to Desktop"
+# does what it does on a Steam Deck: SteamOS Manager writes a one-time session
+# for the login manager and logs out. There is no login manager on this phone,
+# so that one-time choice is read here instead.
+# Landscape is the default: restore it if the display settings file is missing.
+[ -s "$HOME/.config/kwinoutputconfig.json" ] || { mkdir -p "$HOME/.config"; cp /etc/aston/kwinoutputconfig.landscape.json "$HOME/.config/kwinoutputconfig.json"; }
+mode=$(cat /etc/aston/session 2>/dev/null)
+once=$(sed -n 's/^Session=//p' /etc/sddm.conf.d/zzt-steamos-temp-login.conf 2>/dev/null | tail -1)
+case "$once" in
+    plasma*) mode=desktop ;;
+    gamescope*) mode=game ;;
+esac
+case "$mode" in
+    game) exec /usr/local/bin/aston-gamescope-session ;;
+    *)    exec /usr/lib/plasma-dbus-run-session-if-needed /usr/bin/startplasma-wayland ;;
+esac

@@ -1,0 +1,116 @@
+#!/bin/sh
+# aston - one command for the phone-specific bits of this Debian install.
+# Run on the phone (Terminal app or over SSH). Most actions need root; the
+# script re-runs itself through sudo when it has to.
+
+need_root() { [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"; }
+r() { cat "$1" 2>/dev/null || echo "?"; }
+
+status() {
+    slot=$(sed -n 's/.*androidboot.slot_suffix = "_\([ab]\)".*/\1/p' /proc/bootconfig 2>/dev/null)
+    echo "System    $(. /etc/os-release; echo "$PRETTY_NAME"), kernel $(uname -r), slot ${slot:-?}, up $(uptime -p | sed 's/^up //')"
+    echo "Battery   $(r /sys/class/power_supply/battery/capacity)% $(r /sys/class/power_supply/battery/status), $(( $(r /sys/class/power_supply/battery/temp) / 10 )) C, charge limit $(sed -n 's/^CHARGE_LIMIT=\([0-9]*\).*/\1/p' /etc/aston/power.conf)%"
+    skin=; cpu=0; gpu=0
+    for z in /sys/class/thermal/thermal_zone*; do
+        ty=$(r "$z/type"); raw=$(cat "$z/temp" 2>/dev/null | tr -dc "0-9")
+        [ -n "$raw" ] || continue
+        v=$(( raw / 1000 ))
+        case "$ty" in
+            skin-msm-therm) skin=$v ;;
+            cpu-*|cpuss*) [ "$v" -gt "$cpu" ] && [ "$v" -lt 150 ] && cpu=$v ;;
+            gpuss*) [ "$v" -gt "$gpu" ] && [ "$v" -lt 150 ] && gpu=$v ;;
+        esac
+    done
+    echo "Thermal   skin ${skin:-?} C, hottest CPU core $cpu C, hottest GPU sensor $gpu C"
+    echo "Limits    $(sed 's/^skin=[^ ]* cpu=[^ ]* gpu=[^ ]* //' /run/aston-power.state 2>/dev/null)"
+    echo "CPU       profile $(cat /etc/aston/profile 2>/dev/null || echo balanced), governor $(r /sys/devices/system/cpu/cpufreq/policy0/scaling_governor), max $(( $(r /sys/devices/system/cpu/cpufreq/policy7/scaling_max_freq) / 1000 )) MHz (prime core)"
+    echo "GPU       $(r /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage | tr -d ' ') busy at $(( $(r /sys/class/kgsl/kgsl-3d0/gpuclk) / 1000000 )) MHz"
+    echo "Memory    $(free -m | awk '/^Mem/{printf "%d of %d MB used", $3, $2} /^Swap/{printf ", swap %d of %d MB", $3, $2}')"
+    echo "Storage   $(df -h / | awk 'NR==2{print $3 " of " $2 " used"}')"
+    echo "Wi-Fi     $(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep wlan0 | cut -d: -f1 || echo off) $(ip -4 -br addr show wlan0 2>/dev/null | awk '{print $3}')"
+    echo "Bluetooth $(systemctl is-active aston-bluetooth 2>/dev/null)"
+    echo "Session   $(cat /etc/aston/session 2>/dev/null || echo desktop) ($(systemctl is-active aston-session))"
+    failed=$(systemctl --failed --no-legend | wc -l)
+    echo "Services  $(systemctl is-system-running), $failed failed"
+}
+
+case "$1" in
+    ""|status) status ;;
+    shot)
+        need_root "$@"
+        out=${2:-/home/steamos/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).ppm}
+        mkdir -p "$(dirname "$out")"
+        /usr/local/bin/drmshot > "$out" 2>/dev/null && echo "$out (native panel orientation)" ;;
+    charge-limit)
+        need_root "$@"
+        case "$2" in ''|*[!0-9]*) echo "usage: aston charge-limit PERCENT (100 = off)"; exit 1 ;; esac
+        sed -i "s/^CHARGE_LIMIT=[0-9]*/CHARGE_LIMIT=$2/" /etc/aston/power.conf && echo "charge limit: $2%" ;;
+    profile)
+        need_root "$@"
+        case "$2" in balanced|power-saver|performance) echo "$2" > /etc/aston/profile; echo "profile: $2" ;;
+            "") echo "profile: $(cat /etc/aston/profile 2>/dev/null || echo balanced)" ;;
+            *) echo "usage: aston profile balanced|power-saver|performance"; exit 1 ;; esac ;;
+    thermal)
+        cat /run/aston-power.state 2>/dev/null ;;
+    power)
+        b=/sys/class/power_supply/battery
+        sc=$(sed -n 's/^POWER_SCALE=\([0-9]*\).*/\1/p' /etc/aston/power.conf); sc=${sc:-100}
+        if [ "$(cat $b/status)" = Discharging ]; then
+            mw=$(( $(cat $b/voltage_now) / 1000 * $(cat $b/current_now | tr -d -) / 1000 * sc / 100 ))
+            echo "power draw: $(( mw / 1000 )).$(( mw % 1000 / 100 )) W on battery ($(cat $b/capacity)%)"
+        else
+            echo "on charger ($(cat $b/status), $(cat $b/capacity)%): draw cannot be measured while charging"
+        fi ;;
+    tdp)
+        need_root "$@"
+        case "$2" in
+            off|0) v=0 ;;
+            ''|*[!0-9]*) echo "usage: aston tdp WATTS|off   (current: $(sed -n 's/^TDP_WATTS=\([0-9]*\).*/\1/p' /etc/aston/power.conf) W, 0 = off)"; exit 1 ;;
+            *) v=$2 ;;
+        esac
+        if grep -q '^TDP_WATTS=' /etc/aston/power.conf; then sed -i "s/^TDP_WATTS=[0-9]*/TDP_WATTS=$v/" /etc/aston/power.conf
+        else echo "TDP_WATTS=$v" >> /etc/aston/power.conf; fi
+        [ "$v" = 0 ] && echo "power limit: off" || echo "power limit: $v W (applies on battery)" ;;
+    mode)
+        need_root "$@"
+        case "$2" in desktop|game) ;; *) echo "usage: aston mode desktop|game"; exit 1 ;; esac
+        echo "$2" > /etc/aston/session && systemctl restart --no-block aston-session && echo "session mode: $2" ;;
+    bluetooth)
+        need_root "$@"
+        case "$2" in on) systemctl start aston-bluetooth ;; off) systemctl stop aston-bluetooth ;; *) echo "usage: aston bluetooth on|off"; exit 1 ;; esac ;;
+    usb)
+        need_root "$@"
+        case "$2" in host) m=host ;; device) m=peripheral ;; *) echo "usage: aston usb host|device   (host: plug in keyboards, drives, gamepads; device: link to a computer)"; exit 1 ;; esac
+        echo $m > /sys/bus/platform/devices/a600000.ssusb/mode && echo "usb port: $2 mode" ;;
+    restart-ui)
+        need_root "$@"; systemctl restart aston-session ;;
+    logs)
+        journalctl -b -p warning --no-pager | tail -${2:-40} ;;
+    update)
+        need_root "$@"; apt-get update && apt-get -y upgrade ;;
+    android)
+        echo "Switching to Android needs the computer: reboot to the bootloader (aston bootloader),"
+        echo "then run: fastboot --set-active=b && fastboot reboot" ;;
+    bootloader)
+        need_root "$@"; /usr/local/sbin/reboot2 bootloader ;;
+    *)
+        cat <<EOF
+aston - phone tools
+  aston                    status: battery, temperatures, CPU, GPU, memory, network
+  aston shot [FILE]        take a screenshot
+  aston profile NAME       power profile: balanced | power-saver | performance
+  aston thermal            current thermal level and CPU/GPU limits
+  aston power              current power draw (on battery)
+  aston tdp WATTS|off      hold power draw to a wattage on battery
+  aston charge-limit N     stop charging at N percent (100 = off)
+  aston mode NAME          session: desktop | game
+  aston bluetooth on|off   Bluetooth radio
+  aston usb host|device    USB port role (host for accessories, device for a computer)
+  aston restart-ui         restart the desktop session
+  aston logs [N]           recent warnings and errors
+  aston update             install Debian updates
+  aston bootloader         reboot to the bootloader
+  aston android            how to switch to Android
+EOF
+        ;;
+esac

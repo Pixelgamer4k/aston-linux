@@ -1,0 +1,26 @@
+#!/bin/bash
+# Runs inside Gamescope: hand its display to the user's systemd session and run
+# Valve's Steam unit there, so Steam gets the same environment as on SteamOS.
+# The display-driver preload is for Gamescope only, not for Steam and games.
+unset LD_PRELOAD
+systemctl --user unset-environment LD_PRELOAD 2>/dev/null
+# Gamescope's Vulkan presentation layer breaks clients on this GPU driver
+# (their X connection drops when the swapchain is created); present through
+# Xwayland instead.
+export ENABLE_GAMESCOPE_WSI=0
+systemctl --user import-environment DISPLAY XAUTHORITY GAMESCOPE_WAYLAND_DISPLAY XDG_SESSION_TYPE \
+    STEAM_GAME_DISPLAY_0 STEAM_MULTIPLE_XWAYLANDS ENABLE_GAMESCOPE_WSI XCURSOR_THEME QT_IM_MODULE GTK_IM_MODULE 2>/dev/null
+systemctl --user import-environment $(compgen -e | grep -E '^(STEAM_|GAMESCOPE_|SRT_|SDL_VIDEO_MINIMIZE|vk_xwayland|MANGOHUD_CONFIGFILE)') 2>/dev/null
+systemctl --user unset-environment WAYLAND_DISPLAY 2>/dev/null
+# The performance overlay; restarted if it exits, but not in a tight loop.
+if [ -n "$STEAM_USE_MANGOAPP" ] && command -v mangoapp >/dev/null; then
+    ( n=0; while [ $n -lt 20 ]; do LD_PRELOAD=/usr/local/lib/libaston-nohwmon.so mangoapp >/dev/null 2>&1; n=$((n + 1)); sleep 3; done ) &
+    overlay=$!
+fi
+systemctl --user reset-failed steam.service 2>/dev/null
+trap 'systemctl --user stop steam.service; [ -n "$overlay" ] && kill $overlay 2>/dev/null; pkill -x mangoapp 2>/dev/null' EXIT HUP INT TERM
+systemctl --user start steam.service
+# Stay alive for as long as Steam does; Gamescope exits when this script does.
+while systemctl --user is-active --quiet steam.service || systemctl --user is-activating --quiet steam.service 2>/dev/null; do
+    sleep 2
+done

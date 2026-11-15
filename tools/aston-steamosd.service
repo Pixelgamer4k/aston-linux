@@ -1,0 +1,13 @@
+[Unit]
+Description=Steam Quick Access controls for this phone (TDP, charge limit, GPU clock, profile)
+After=dbus.service
+Before=steamos-manager.service
+
+[Service]
+Type=dbus
+BusName=com.aston.SteamOS
+ExecStart=/usr/local/sbin/aston-steamosd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

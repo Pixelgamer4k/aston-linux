@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""Bring up the WCN7850 Bluetooth controller on the OnePlus 12R.
+
+The 5.15 kernel's built-in QCA loader predates this chip and cannot parse its
+replies, so this does the same job from user space: power the chip, read its
+version, switch the UART to operating speed, download the patch and NVM
+firmware, and reset the controller.  Afterwards the UART speaks plain H4 and
+can be handed to `btattach -P h4`.
+
+In-band sleep and deep sleep are switched off in the NVM image so that no
+vendor sleep bytes appear on the line (the plain H4 driver would choke on them).
+
+Usage: aston-btfw [--tty /dev/ttyHS0] [--baud 3000000] [--no-speed-change] [--bridge] [-v]
+
+With --bridge it keeps running: the kernel's H4 driver is attached to a
+pseudo-terminal and this program relays between that and the real UART,
+keeping the UART awake and correcting one reply the old kernel rejects.
+"""
+import argparse
+import fcntl
+import os
+import select
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+FW_DIR = "/lib/firmware/qca"
+BT_CMD_PWR_CTRL = 0xBFAD
+EDL_OPCODE = 0xFC00
+EDL_VER_REQ, EDL_TLV_REQ, EDL_BID_REQ = 0x19, 0x01, 0x23
+BAUD_OPCODE = 0xFC48
+BAUD_CODES = {115200: 0x00, 3000000: 0x0E, 3200000: 0x11}
+TLV_PATCH, TLV_NVM = 1, 2
+TAG_HCI, TAG_DEEP_SLEEP = 17, 27
+SEG = 243
+VERBOSE = False
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+def dbg(*a):
+    if VERBOSE:
+        log("  ", *a)
+
+
+def power(on):
+    fd = os.open("/dev/btpower", os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, BT_CMD_PWR_CTRL, 1 if on else 0)
+    finally:
+        os.close(fd)
+
+
+class Uart:
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        self.buf = b""
+        self.configure(115200)
+
+    def configure(self, baud, flow=True):
+        a = termios.tcgetattr(self.fd)
+        a[0] = 0                                                  # iflag
+        a[1] = 0                                                  # oflag
+        a[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | (termios.CRTSCTS if flow else 0)
+        a[3] = 0                                                  # lflag
+        speed = getattr(termios, "B%d" % baud)
+        a[4] = a[5] = speed
+        a[6][termios.VMIN], a[6][termios.VTIME] = 0, 0
+        termios.tcsetattr(self.fd, termios.TCSANOW, a)
+
+    def flush_input(self):
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        self.buf = b""
+
+    def write(self, data):
+        while data:
+            if not select.select([], [self.fd], [], 3.0)[1]:
+                lines = struct.unpack("I", fcntl.ioctl(self.fd, termios.TIOCMGET, b"\0\0\0\0"))[0]
+                raise OSError("UART transmit stalled (CTS %s)" % ("high" if lines & termios.TIOCM_CTS else "low"))
+            n = os.write(self.fd, data)
+            data = data[n:]
+
+    def drain(self):
+        termios.tcdrain(self.fd)
+
+    def cmd(self, opcode, params=b""):
+        pkt = bytes([0x01, opcode & 0xFF, opcode >> 8, len(params)]) + params
+        dbg("tx", pkt[:16].hex(), "..." if len(pkt) > 16 else "")
+        self.write(pkt)
+
+    def event(self, timeout):
+        """Return (event_code, payload) for the next HCI event, or None."""
+        end = time.monotonic() + timeout
+        while True:
+            # Resynchronise on the H4 event indicator.
+            i = self.buf.find(b"\x04")
+            if i > 0:
+                dbg("skip", self.buf[:i].hex())
+                self.buf = self.buf[i:]
+            elif i < 0 and self.buf:
+                dbg("skip", self.buf.hex())
+                self.buf = b""
+            if len(self.buf) >= 3 and len(self.buf) >= 3 + self.buf[2]:
+                n = 3 + self.buf[2]
+                pkt, self.buf = self.buf[:n], self.buf[n:]
+                dbg("rx", pkt[:24].hex())
+                return pkt[1], pkt[3:]
+            left = end - time.monotonic()
+            if left <= 0:
+                return None
+            if select.select([self.fd], [], [], left)[0]:
+                self.buf += os.read(self.fd, 4096)
+
+    def edl(self, timeout=2.0):
+        """Wait for a vendor reply; return its bytes starting at (cresp, rtype, ...)."""
+        end = time.monotonic() + timeout
+        while True:
+            ev = self.event(max(0.0, end - time.monotonic()))
+            if ev is None:
+                return None
+            code, p = ev
+            if code == 0x0E and len(p) >= 3:      # command complete: ncmd, opcode, params
+                return p[3:]
+            if code == 0xFF:                      # vendor event
+                return p
+
+
+def read_version(u):
+    u.cmd(EDL_OPCODE, bytes([EDL_VER_REQ]))
+    r = u.edl()
+    if not r or r[1] != EDL_VER_REQ:
+        sys.exit("no version reply from the controller (reply: %s)" % (r.hex() if r else None))
+    ver = r[-12:]
+    product, patch, rom, soc = struct.unpack("<IHHI", ver)
+    soc_ver = (soc << 16) | rom
+    rom_ver = ((soc_ver & 0xF00) >> 4) | (soc_ver & 0xF)
+    log("controller: product 0x%08x soc 0x%08x rom 0x%04x patch 0x%04x -> firmware %02x" % (product, soc, rom, patch, rom_ver))
+    return rom_ver
+
+
+def read_board_id(u):
+    u.cmd(EDL_OPCODE, bytes([EDL_BID_REQ]))
+    r = u.edl()
+    if not r or r[1] != EDL_BID_REQ or len(r) < 5:
+        log("board id: no reply, using the generic NVM")
+        return 0
+    bid = (r[3] << 8) | r[4]
+    log("board id: 0x%x" % bid)
+    return bid
+
+
+def set_speed(u, baud):
+    u.flush_input()
+    u.configure(115200, flow=False)     # hardware flow control off across the switch
+    u.cmd(BAUD_OPCODE, bytes([BAUD_CODES[baud]]))
+    u.drain()
+    time.sleep(0.05)
+    u.configure(baud, flow=False)
+    time.sleep(0.05)
+    u.configure(baud, flow=True)
+    u.event(0.3)        # the reply arrives at the new speed; it is not required
+    u.flush_input()
+    log("uart speed: %d" % baud)
+
+
+def bdaddr():
+    """Stable Bluetooth address: the NVM file only carries a placeholder.
+
+    Derived once from the Wi-Fi address (next address up, as combo chips are
+    normally provisioned) and then kept in /etc/aston/bdaddr.
+    """
+    path = "/etc/aston/bdaddr"
+    try:
+        return bytes.fromhex(open(path).read().strip().replace(":", ""))
+    except (OSError, ValueError):
+        pass
+    try:
+        mac = bytearray(bytes.fromhex(open("/sys/class/net/wlan0/address").read().strip().replace(":", "")))
+        mac[5] = (mac[5] + 1) & 0xFF
+    except (OSError, ValueError):
+        mac = bytearray(b"\x02" + os.urandom(5))
+    with open(path, "w") as f:
+        f.write(":".join("%02X" % b for b in mac) + "\n")
+    return bytes(mac)
+
+
+def patch_nvm(data, baud_code):
+    data = bytearray(data)
+    length = struct.unpack_from("<I", data, 0)[0] >> 8
+    idx = 4
+    while idx + 12 <= min(len(data), 4 + length):
+        tag, tlen = struct.unpack_from("<HH", data, idx)
+        body = idx + 12
+        if tag == 2 and tlen == 6:
+            data[body:body + 6] = bdaddr()[::-1]
+        elif tag == TAG_HCI and tlen >= 2:
+            data[body] &= 0x7F              # no in-band sleep
+            data[body + 1] = baud_code      # controller UART speed after reset
+        elif tag == TAG_DEEP_SLEEP and tlen >= 1:
+            data[body] = 0                  # no deep sleep
+            if tlen >= 2:
+                data[body + 1] = 0
+        idx = body + tlen
+    return bytes(data)
+
+
+def download(u, path, data):
+    kind = data[0]
+    mode = data[4 + 10] if kind == TLV_PATCH else 0   # which acknowledgements the patch asks for
+    log("%s: %d bytes, type %d, ack mode %d" % (os.path.basename(path), len(data), kind, mode))
+    total = (len(data) + SEG - 1) // SEG
+    for n in range(total):
+        seg = data[n * SEG:(n + 1) * SEG]
+        last = n == total - 1
+        try:
+            u.cmd(EDL_OPCODE, bytes([EDL_TLV_REQ, len(seg)]) + seg)
+        except OSError as e:
+            sys.exit("%s: segment %d of %d: %s; pending input: %s" % (os.path.basename(path), n + 1, total, e, (u.buf + (os.read(u.fd, 256) if select.select([u.fd], [], [], 0)[0] else b"")).hex()))
+        # This controller acknowledges every segment even when the patch header
+        # says it will not; unread replies eventually block its transmitter.
+        r = u.edl(5.0 if last else (0.3 if mode == 3 else 2.0))
+        if n == 0 or last:
+            dbg("ack", r.hex() if r else None)
+        if r is None and mode == 3 and not last:
+            continue
+        if r is None:
+            sys.exit("%s: no acknowledgement for segment %d of %d" % (os.path.basename(path), n + 1, total))
+        if (mode == 0 or last) and len(u.buf) == 0:
+            u.event(0.02)                   # optional second acknowledgement
+    u.drain()
+    log("%s: sent" % os.path.basename(path))
+
+
+def pin_uart_awake(tty_path):
+    """Stop the phone's UART from runtime-suspending while Bluetooth is up.
+
+    The port powers down after 150 ms of idle and then neither sends nor
+    receives.  It must be left in its default mode while firmware loads.
+    """
+    ctl = os.path.realpath("/sys/class/tty/%s/device" % os.path.basename(tty_path)) + "/power/control"
+    with open(ctl, "w") as f:
+        f.write("on")
+
+
+def fix_event(pkt):
+    """Rewrite controller replies the 5.15 kernel cannot cope with."""
+    # Command Complete for Read Local Supported Commands: the chip claims
+    # Read/Write Default Erroneous Data Reporting but rejects them, and the
+    # kernel treats that rejection as a failed start-up.
+    if len(pkt) >= 7 + 19 and pkt[1] == 0x0E and pkt[4] == 0x02 and pkt[5] == 0x10 and pkt[6] == 0x00:
+        b = bytearray(pkt)
+        b[7 + 18] &= ~0x0C & 0xFF
+        return bytes(b)
+    return pkt
+
+
+def split_packets(buf):
+    """Split controller output into whole H4 packets; return (packets, rest)."""
+    out = []
+    while buf:
+        kind = buf[0]
+        if kind == 0x04:
+            need = 3 + buf[2] if len(buf) >= 3 else None
+        elif kind == 0x02:
+            need = 5 + struct.unpack_from("<H", buf, 3)[0] if len(buf) >= 5 else None
+        elif kind == 0x03:
+            need = 4 + buf[3] if len(buf) >= 4 else None
+        elif kind == 0x05:
+            need = 5 + (struct.unpack_from("<H", buf, 3)[0] & 0x3FFF) if len(buf) >= 5 else None
+        else:
+            buf = buf[1:]          # not a packet start; drop the byte
+            continue
+        if need is None or len(buf) < need:
+            break
+        out.append(buf[:need])
+        buf = buf[need:]
+    return out, buf
+
+
+def bridge(u, tty_path):
+    """Present the controller to the kernel on a pseudo-terminal and relay traffic."""
+    pin_uart_awake(tty_path)
+    master, slave = os.openpty()
+    tty.setraw(slave)
+    name = os.ttyname(slave)
+    child = subprocess.Popen(["btattach", "-B", name, "-P", "h4"], stdout=subprocess.DEVNULL)
+    log("bridge: %s <-> %s, btattach pid %d" % (tty_path, name, child.pid))
+    pending = b""
+    try:
+        while child.poll() is None:
+            ready = select.select([u.fd, master], [], [], 1.0)[0]
+            if master in ready:
+                u.write(os.read(master, 4096))
+            if u.fd in ready:
+                pending += os.read(u.fd, 4096)
+                packets, pending = split_packets(pending)
+                for pkt in packets:
+                    os.write(master, fix_event(pkt) if pkt[0] == 0x04 else pkt)
+    finally:
+        child.terminate()
+    sys.exit("btattach exited")
+
+
+def main():
+    global VERBOSE
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tty", default="/dev/ttyHS0")
+    ap.add_argument("--baud", type=int, default=3000000, choices=sorted(BAUD_CODES))
+    ap.add_argument("--no-speed-change", action="store_true")
+    ap.add_argument("--bridge", action="store_true", help="stay running and attach the controller to the kernel")
+    ap.add_argument("-v", action="store_true")
+    a = ap.parse_args()
+    VERBOSE = a.v
+    baud = 115200 if a.no_speed_change else a.baud
+
+    for state in (False, True):
+        try:
+            power(state)
+        except OSError as e:
+            dbg("power %s: %s" % ("on" if state else "off", e))
+        time.sleep(1.0 if state else 0.4)   # the chip needs time to boot its ROM
+    time.sleep(0.5)
+
+    u = Uart(a.tty)
+    u.flush_input()
+    rom_ver = read_version(u)
+    if baud != 115200:
+        set_speed(u, baud)
+        read_version(u)                    # proves the link works at the new speed
+
+    fw = "%s/hmtbtfw%02x.tlv" % (FW_DIR, rom_ver)
+    download(u, fw, open(fw, "rb").read())
+    time.sleep(0.1)
+
+    bid = read_board_id(u)
+    nvm = "%s/hmtnv%02x.bin" % (FW_DIR, rom_ver)
+    if bid:
+        by_board = "%s/hmtnv%02x.b%x" % (FW_DIR, rom_ver, bid) if bid & 0xFF00 else "%s/hmtnv%02x.b%02x" % (FW_DIR, rom_ver, bid)
+        if os.path.exists(by_board):
+            nvm = by_board
+    download(u, nvm, patch_nvm(open(nvm, "rb").read(), BAUD_CODES[baud]))
+    time.sleep(0.1)
+
+    u.flush_input()
+    u.cmd(0x0C03)                           # HCI reset
+    r = u.event(3.0)
+    if r is None or r[0] != 0x0E:
+        sys.exit("controller did not answer the reset after firmware download")
+    # The address in the NVM file is a placeholder; program the real one.
+    want = bdaddr()
+    for order in (want[::-1], want):
+        u.cmd(0xFC14, order)
+        u.event(1.0)
+        u.cmd(0x1009)                       # Read BD_ADDR
+        r = u.event(1.0)
+        got = r[1][4:10][::-1] if r and len(r[1]) >= 10 else b""
+        if got == want:
+            break
+    log("address: %s" % (":".join("%02X" % b for b in got) or "unknown"))
+    log("controller reset ok, ready for H4 at %d baud" % baud)
+    if a.bridge:
+        bridge(u, a.tty)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,73 @@
+#!/bin/bash
+# Gaming Mode: Gamescope owns the phone's panel and runs the Steam interface
+# inside it, the way a Steam Deck does. Started by aston-session-start.
+#
+# Valve's own gamescope-session on this SteamOS build targets their VR headset
+# (OpenVR backend), so this is the Steam Deck equivalent for a flat panel.
+
+set -a; . /etc/aston/gpu.env; set +a
+export LIBSEAT_BACKEND=logind
+export XDG_SESSION_TYPE=x11
+export XCURSOR_THEME=steam
+export QT_IM_MODULE=xim GTK_IM_MODULE=xim
+export QT_QPA_PLATFORMTHEME=kde
+export SRT_LOG_TO_JOURNAL=1
+# What Valve's Steam Deck session sets up for Steam: where Gamescope leaves the
+# display's corrected EDID (Steam reads the native resolution from it), where
+# it saves display modes and the frame limiter state, and which Gamescope
+# features Steam may offer in its menus.
+mkdir -p "$HOME/.config/gamescope"
+export GAMESCOPE_MODE_SAVE_FILE="$HOME/.config/gamescope/modes.cfg"
+export GAMESCOPE_PATCHED_EDID_FILE="$HOME/.config/gamescope/edid.bin"
+touch "$GAMESCOPE_MODE_SAVE_FILE" "$GAMESCOPE_PATCHED_EDID_FILE"
+export GAMESCOPE_LIMITER_FILE="$XDG_RUNTIME_DIR/gamescope-limiter"
+: > "$GAMESCOPE_LIMITER_FILE"
+export GAMESCOPE_NV12_COLORSPACE=k_EStreamColorspace_BT601
+export STEAM_MULTIPLE_XWAYLANDS=1
+export STEAM_GAMESCOPE_NIS_SUPPORTED=1
+export STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1
+export STEAM_GAMESCOPE_COLOR_MANAGED=1
+export STEAM_GAMESCOPE_VIRTUAL_WHITE=1
+export STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1
+export STEAM_GAMESCOPE_HAS_TEARING_SUPPORT=1
+export STEAM_GAMESCOPE_TEARING_SUPPORTED=1
+export STEAM_ENABLE_VOLUME_HANDLER=1
+export STEAM_ALLOW_DRIVE_UNMOUNT=1
+export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1
+export SRT_URLOPEN_PREFER_STEAM=1
+export SDL_VIDEO_MINIMIZE_ON_FOCUS_LOSS=0
+export vk_xwayland_wait_ready=false
+# Performance overlay: Steam writes the chosen overlay level into this file and
+# mangoapp (started next to Steam) draws it.
+export STEAM_USE_MANGOAPP=1
+export STEAM_MANGOAPP_PRESETS_SUPPORTED=1
+export STEAM_MANGOAPP_HORIZONTAL_SUPPORTED=1
+export MANGOHUD_CONFIGFILE="$XDG_RUNTIME_DIR/mangohud-gamescope.conf"
+echo no_display > "$MANGOHUD_CONFIGFILE"
+
+# These belong to the desktop session and confuse Gamescope and its Xwayland.
+unset DISPLAY XAUTHORITY WAYLAND_DISPLAY
+
+. /etc/aston/gamescope.conf 2>/dev/null
+: "${GAME_WIDTH:=1390}" "${GAME_HEIGHT:=632}" "${ORIENTATION:=right}" "${REFRESH:=120}"
+
+# Gamescope needs an IN_FORMATS list this display driver does not publish; the
+# preload supplies it. The copy without file capabilities is used because
+# privileged programs ignore LD_PRELOAD.
+export LD_PRELOAD=/usr/local/lib/libaston-drm-informats.so
+if [ -n "$GAMESCOPE_ARGS" ]; then
+    exec /usr/local/bin/gamescope-drm $GAMESCOPE_ARGS
+fi
+exec /usr/local/bin/gamescope-drm \
+    --backend drm \
+    --prefer-output DSI-1 \
+    --force-orientation "$ORIENTATION" --force-composition-rotation \
+    --nested-width "$GAME_WIDTH" --nested-height "$GAME_HEIGHT" \
+    --nested-refresh "$REFRESH" \
+    --filter fsr \
+    --default-touch-mode 4 \
+    --hide-cursor-delay 3000 \
+    --fade-out-duration 200 \
+    --xwayland-count 2 \
+    --steam \
+    $GAMESCOPE_EXTRA -- ${GAMESCOPE_CLIENT:-/usr/local/bin/aston-gamescope-steam}

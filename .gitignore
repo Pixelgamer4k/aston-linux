@@ -1,0 +1,12 @@
+# Allow-list: only the published parts of this folder are tracked.
+# Everything else (keys, backups, firmware, images, build outputs) stays local.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/boot/
+!/docs/
+!/patches/
+!/tools/
+tools/sgdisk-splitter
+.DS_Store

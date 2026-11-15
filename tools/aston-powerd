@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Power policy for the OnePlus 12R.
+
+Android's thermal and power daemons are not running here, so this does the
+three jobs they would do:
+  * apply the selected power profile (/etc/aston/profile) to the CPU
+  * limit CPU and GPU speed by skin temperature, following OnePlus's own factory tables
+  * stop charging at a chosen battery percentage
+  * hold whole-phone power draw to a chosen wattage on battery (a TDP-style limit)
+
+Settings live in /etc/aston/power.conf (KEY=value, re-read while running).
+"""
+import glob
+import os
+import time
+
+CONF = "/etc/aston/power.conf"
+DEFAULTS = {
+    "CHARGE_LIMIT": 100,        # percent; 100 = never stop charging
+    "TEMP_OFFSET": 0,           # added to the sensor reading before the tables are applied
+    "GOVERNOR": "walt", "SAVER_GOVERNOR": "walt", "PERFORMANCE_GOVERNOR": "performance",
+    "SAVER_LEVEL": 6,           # minimum CPU level forced in the power-saver profile
+    "TDP_WATTS": 0,             # whole-phone power target on battery; 0 = no limit
+    "POWER_SCALE": 200,         # percent applied to voltage x current (see power_watts)
+    "GPU_MAX_MHZ": 0,           # GPU clock ceiling chosen by the user; 0 = automatic
+}
+
+# --- OnePlus 12R factory thermal policy -------------------------------------
+# Taken from the phone's own /odm/etc/temperature_profile/sys_thermal_control_config.xml
+# (version 2025111801). CPU levels are maximum frequencies in kHz for the
+# little, big and prime clusters; None means "cluster off" in the original and
+# is treated here as the lowest frequency.
+CPU_LEVELS = [
+    (1785600, 2323200, 2227200), (1785600, 2188800, 1977600), (1785600, 2054400, 1708800),
+    (1459200, 1920000, 1708800), (1459200, 1785600, 1593600), (1459200, 1651200, 1363200),
+    (1017600, 1401600, 1363200), (1017600, 1171200, 1248000), (1017600, 1056000, 729600),
+    (787200, 1056000, None),
+]
+GPU_LEVELS = [None, 645000000, 580000000, 515000000, 364000000]     # max GPU clock in Hz
+# "Gear" in the factory file is a skin-temperature step. The file does not
+# state the scale; gear = temperature - 35 C lines up with its own thresholds
+# (40 C preheat = first real limit, 44 C heat, 49 C strongest limits).
+GEAR_BASE = 35
+# gear: (cpu level, gpu level); -1 = no limit. Rows apply from that gear upward.
+POLICY_DEFAULT = {3: (2, -1), 5: (3, -1), 6: (4, -1), 8: (5, -1), 11: (7, 3), 14: (9, 4)}
+POLICY_GAME = {5: (1, -1), 6: (2, -1), 7: (3, -1), 8: (4, -1), 10: (5, -1), 11: (6, 3), 13: (9, 4)}
+
+POLICIES = sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*"))
+CHARGE_EN = "/sys/class/oplus_chg/battery/mmi_charging_enable"
+GPU_MAX = "/sys/class/kgsl/kgsl-3d0/devfreq/max_freq"
+GPU_FREQS = "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies"
+STATE = "/run/aston-power.state"
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def write(path, value):
+    try:
+        if read(path) != str(value):
+            with open(path, "w") as f:
+                f.write(str(value))
+    except OSError as e:
+        print(f"write {path}={value}: {e}", flush=True)
+
+
+def config():
+    c = dict(DEFAULTS)
+    for line in read(CONF).splitlines():
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.split("#")[0].strip()
+        if k in c and v:
+            c[k] = int(v) if isinstance(DEFAULTS[k], int) else v
+    return c
+
+
+def skin_temp():
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if read(z + "/type") == "skin-msm-therm":
+            try:
+                return int(read(z + "/temp")) / 1000
+            except ValueError:
+                return None
+    return None
+
+
+def hottest(prefixes):
+    """Highest reading in deg C among thermal zones whose type starts with one of the prefixes."""
+    best = None
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if read(z + "/type").startswith(prefixes):
+            try:
+                v = int(read(z + "/temp")) / 1000
+            except ValueError:
+                continue
+            if 0 < v < 150 and (best is None or v > best):
+                best = v
+    return best
+
+
+# Chip (junction) temperatures. The kernel's own trip points, the same ones
+# Android relies on, protect the silicon from 95 C upward; these softer steps
+# start earlier so the chip does not sit at those limits during long sessions.
+CPU_JUNCTION_STEPS = ((85, 4), (92, 6), (98, 8))        # (deg C, minimum CPU level)
+GPU_JUNCTION_STEPS = ((80, 2), (86, 3), (92, 4))        # (deg C, minimum GPU level)
+
+
+def junction_floor(temp, steps):
+    floor = -1
+    if temp is not None:
+        for limit, level in steps:
+            if temp >= limit:
+                floor = level
+    return floor
+
+
+def power_watts(scale):
+    """Whole-phone power draw in watts while on battery, else None.
+
+    The battery is two cells in series. The fuel gauge reports one cell's
+    voltage (about 4 V, not the pack's 8 V) and the real current through the
+    pack in mA, so voltage x current is half the true power: POWER_SCALE=200.
+    Measured: under a steady load the reported current averaged 636 mA while
+    the gauge's own charge counter fell at 1284 mA.
+    """
+    b = "/sys/class/power_supply/battery/"
+    if read(b + "status") != "Discharging":
+        return None
+    try:
+        return int(read(b + "voltage_now")) / 1e6 * abs(int(read(b + "current_now"))) / 1e3 * scale / 100
+    except ValueError:
+        return None
+
+
+def profile():
+    """Selected profile: balanced, power-saver or performance (set with `aston profile`)."""
+    p = read("/etc/aston/profile")
+    return p if p in ("balanced", "power-saver", "performance") else "balanced"
+
+
+def game_running():
+    """True while Steam has a game process running (it wraps every game in its reaper)."""
+    for d in glob.glob("/proc/[0-9]*/comm"):
+        if read(d) == "reaper":
+            return True
+    return False
+
+
+def lookup(policy, gear):
+    cpu, gpu = -1, -1
+    for g in sorted(policy):
+        if gear >= g:
+            cpu, gpu = policy[g]
+    return cpu, gpu
+
+
+def apply_cpu(governor, cpu_level):
+    for n, p in enumerate(POLICIES):
+        freqs = sorted(int(f) for f in read(p + "/scaling_available_frequencies").split())
+        if not freqs:
+            continue
+        limit = freqs[-1] if cpu_level < 0 else CPU_LEVELS[cpu_level][min(n, 2)]
+        target = freqs[0] if limit is None else max((f for f in freqs if f <= limit), default=freqs[0])
+        write(p + "/scaling_governor", governor)
+        write(p + "/scaling_max_freq", target)
+
+
+def apply_gpu(gpu_level, user_mhz=0):
+    freqs = sorted(int(f) for f in read(GPU_FREQS).split())
+    if not freqs:
+        return
+    limit = freqs[-1] if gpu_level <= 0 else GPU_LEVELS[gpu_level]
+    if user_mhz > 0:
+        limit = min(limit, user_mhz * 1000000)
+    write(GPU_MAX, max((f for f in freqs if f <= limit), default=freqs[0]))
+
+
+def main():
+    last = None
+    gear = 0
+    tdp_level = -1              # extra CPU limit level held by the power target
+    recent = []                 # last few power readings, for a short average
+    while True:
+        c = config()
+        t = skin_temp()
+        if t is not None:
+            want = int(t + c["TEMP_OFFSET"]) - GEAR_BASE
+            if want > gear:
+                gear = want
+            elif want < gear - 1:           # one degree of hysteresis on the way down
+                gear = want + 1
+        prof = profile()
+        game = game_running()
+        cpu_level, gpu_level = lookup(POLICY_GAME if game else POLICY_DEFAULT, gear)
+        cpu_t, gpu_t = hottest(("cpu-", "cpuss")), hottest(("gpuss",))
+        cpu_level = max(cpu_level, junction_floor(cpu_t, CPU_JUNCTION_STEPS))
+        gpu_level = max(gpu_level, junction_floor(gpu_t, GPU_JUNCTION_STEPS))
+        # Power target: step the limit up while the average draw is above the
+        # target, and back down once there is clear headroom.
+        watts = power_watts(c["POWER_SCALE"])
+        avg = None
+        if watts is not None:
+            recent = (recent + [watts])[-3:]
+            avg = sum(recent) / len(recent)
+        if c["TDP_WATTS"] > 0 and avg is not None:
+            if avg > c["TDP_WATTS"] * 1.05 and tdp_level < 9:
+                tdp_level += 1
+            elif avg < c["TDP_WATTS"] * 0.85 and tdp_level > -1:
+                tdp_level -= 1
+        else:
+            tdp_level = -1
+        cpu_level = max(cpu_level, tdp_level)
+        gpu_level = max(gpu_level, min(4, tdp_level // 2) if tdp_level > 0 else -1)
+        governor = c["GOVERNOR"]
+        if prof == "power-saver":
+            governor = c["SAVER_GOVERNOR"]
+            cpu_level = max(cpu_level, c["SAVER_LEVEL"])
+        elif prof == "performance":
+            governor = c["PERFORMANCE_GOVERNOR"]
+        apply_cpu(governor, cpu_level)
+        apply_gpu(gpu_level, c["GPU_MAX_MHZ"])
+
+        battery = read("/sys/class/power_supply/battery/capacity")
+        charging = "on"
+        if battery.isdigit() and c["CHARGE_LIMIT"] < 100:
+            if int(battery) >= c["CHARGE_LIMIT"]:
+                write(CHARGE_EN, 0)
+            elif int(battery) <= c["CHARGE_LIMIT"] - 5:
+                write(CHARGE_EN, 1)
+            charging = "on" if read(CHARGE_EN) == "1" else "held"
+        else:
+            write(CHARGE_EN, 1)
+
+        state = (governor, gear if gear > 0 else 0, cpu_level, gpu_level, game, charging, c["TDP_WATTS"], c["GPU_MAX_MHZ"])
+        if state != last:
+            line = "skin=%sC cpu=%sC gpu=%sC gear=%d policy=%s cpu_level=%d gpu_level=%d tdp=%s power=%s governor=%s profile=%s charging=%s battery=%s%%" % (
+                t, cpu_t, gpu_t, gear, "game" if game else "default", cpu_level, gpu_level,
+                ("%dW" % c["TDP_WATTS"]) if c["TDP_WATTS"] > 0 else "off",
+                ("%.1fW" % avg) if avg is not None else "n/a", governor, prof, charging, battery)
+            print(line, flush=True)
+            try:
+                with open(STATE, "w") as f:
+                    f.write(line + "\n")
+            except OSError:
+                pass
+            last = state
+        time.sleep(4)
+
+
+if __name__ == "__main__":
+    main()

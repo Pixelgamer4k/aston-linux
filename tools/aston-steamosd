@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Steam Quick Access controls for the OnePlus 12R.
+
+Steam's performance menu talks to SteamOS Manager, which knows a list of PC
+handhelds but not this phone. SteamOS Manager lets another service supply the
+missing controls ("remote interfaces", see /etc/steamos-manager/remotes.d);
+this is that service. Each control maps onto what aston-powerd already does:
+
+  TDP limit            -> TDP_WATTS in /etc/aston/power.conf
+  Battery charge limit -> CHARGE_LIMIT
+  Manual GPU clock     -> GPU_MAX_MHZ (a ceiling; 0 = automatic)
+  Performance profile  -> /etc/aston/profile
+"""
+import os
+import re
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BUS_NAME = "com.aston.SteamOS"
+PATH = "/com/aston/SteamOS"
+PREFIX = "com.steampowered.SteamOSManager1."
+CONF = "/etc/aston/power.conf"
+PROFILE = "/etc/aston/profile"
+
+TDP_MIN, TDP_MAX = 3, 15            # watts; the maximum means "no limit"
+GPU_FREQS = "/sys/class/kgsl/kgsl-3d0/gpu_available_frequencies"
+# Steam's names (the kernel's platform-profile names) -> aston-powerd's
+PROFILES = {"low-power": "power-saver", "balanced": "balanced", "performance": "performance"}
+
+
+def conf_get(key, default):
+    try:
+        for line in open(CONF):
+            k, _, v = line.partition("=")
+            if k.strip() == key:
+                return int(v.split("#")[0].strip())
+    except (OSError, ValueError):
+        pass
+    return default
+
+
+def conf_set(key, value):
+    try:
+        text = open(CONF).read()
+    except OSError:
+        text = ""
+    if re.search(rf"^{key}=", text, re.M):
+        text = re.sub(rf"^{key}=.*$", f"{key}={value}", text, flags=re.M)
+    else:
+        text = text.rstrip("\n") + f"\n{key}={value}\n"
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, CONF)
+
+
+def gpu_range():
+    try:
+        mhz = sorted(int(f) // 1000000 for f in open(GPU_FREQS).read().split())
+        return mhz[0], mhz[-1]
+    except (OSError, ValueError, IndexError):
+        return 220, 680
+
+
+class Controls(dbus.service.Object):
+    def __init__(self, bus):
+        super().__init__(bus, PATH)
+        self.gpu_min, self.gpu_max = gpu_range()
+
+    # --- property tables: interface -> name -> (getter, setter or None) ------
+    def table(self):
+        return {
+            PREFIX + "TdpLimit1": {
+                "TdpLimit": (self.get_tdp, self.set_tdp),
+                "TdpLimitMin": (lambda: dbus.UInt32(TDP_MIN), None),
+                "TdpLimitMax": (lambda: dbus.UInt32(TDP_MAX), None),
+            },
+            PREFIX + "BatteryChargeLimit1": {
+                "MaxChargeLevel": (lambda: dbus.Int32(conf_get("CHARGE_LIMIT", 100)), self.set_charge),
+                "SuggestedMinimumLimit": (lambda: dbus.Int32(10), None),
+            },
+            PREFIX + "GpuPerformanceLevel1": {
+                "AvailableGpuPerformanceLevels": (lambda: dbus.Array(["auto", "manual"], signature="s"), None),
+                "GpuPerformanceLevel": (self.get_gpu_level, self.set_gpu_level),
+                "ManualGpuClock": (self.get_gpu_clock, self.set_gpu_clock),
+                "ManualGpuClockMin": (lambda: dbus.UInt32(self.gpu_min), None),
+                "ManualGpuClockMax": (lambda: dbus.UInt32(self.gpu_max), None),
+            },
+            PREFIX + "PerformanceProfile1": {
+                "AvailablePerformanceProfiles": (lambda: dbus.Array(list(PROFILES), signature="s"), None),
+                "PerformanceProfile": (self.get_profile, self.set_profile),
+                "SuggestedDefaultPerformanceProfile": (lambda: dbus.String("balanced"), None),
+            },
+        }
+
+    # --- TDP ------------------------------------------------------------------
+    def get_tdp(self):
+        watts = conf_get("TDP_WATTS", 0)
+        return dbus.UInt32(watts if TDP_MIN <= watts < TDP_MAX else TDP_MAX)
+
+    def set_tdp(self, value):
+        watts = max(TDP_MIN, min(TDP_MAX, int(value)))
+        conf_set("TDP_WATTS", 0 if watts >= TDP_MAX else watts)
+
+    # --- charge limit ---------------------------------------------------------
+    def set_charge(self, value):
+        value = int(value)
+        conf_set("CHARGE_LIMIT", 100 if value < 0 else max(10, min(100, value)))
+
+    # --- GPU ------------------------------------------------------------------
+    def get_gpu_level(self):
+        return dbus.String("manual" if conf_get("GPU_MAX_MHZ", 0) > 0 else "auto")
+
+    def set_gpu_level(self, value):
+        if str(value) == "manual":
+            if conf_get("GPU_MAX_MHZ", 0) <= 0:
+                conf_set("GPU_MAX_MHZ", self.gpu_max)
+        else:
+            conf_set("GPU_MAX_MHZ", 0)
+
+    def get_gpu_clock(self):
+        mhz = conf_get("GPU_MAX_MHZ", 0)
+        return dbus.UInt32(mhz if mhz > 0 else self.gpu_max)
+
+    def set_gpu_clock(self, value):
+        conf_set("GPU_MAX_MHZ", max(self.gpu_min, min(self.gpu_max, int(value))))
+
+    # --- profile --------------------------------------------------------------
+    def get_profile(self):
+        try:
+            ours = open(PROFILE).read().strip()
+        except OSError:
+            ours = "balanced"
+        for steam, name in PROFILES.items():
+            if name == ours:
+                return dbus.String(steam)
+        return dbus.String("balanced")
+
+    def set_profile(self, value):
+        if str(value) not in PROFILES:
+            raise dbus.exceptions.DBusException("unknown profile", name="org.freedesktop.DBus.Error.InvalidArgs")
+        with open(PROFILE, "w") as f:
+            f.write(PROFILES[str(value)] + "\n")
+
+    # --- org.freedesktop.DBus.Properties ---------------------------------------
+    def lookup(self, interface, name):
+        try:
+            return self.table()[interface][name]
+        except KeyError:
+            raise dbus.exceptions.DBusException(f"no property {interface}.{name}",
+                                                name="org.freedesktop.DBus.Error.UnknownProperty")
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface, name):
+        return self.lookup(interface, name)[0]()
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface):
+        return {name: get() for name, (get, _) in self.table().get(interface, {}).items()}
+
+    @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ssv")
+    def Set(self, interface, name, value):
+        get, setter = self.lookup(interface, name)
+        if setter is None:
+            raise dbus.exceptions.DBusException("read-only", name="org.freedesktop.DBus.Error.PropertyReadOnly")
+        setter(value)
+        changed = {name: get()}
+        if name == "GpuPerformanceLevel":
+            changed["ManualGpuClock"] = self.get_gpu_clock()
+        elif name == "ManualGpuClock":
+            changed["GpuPerformanceLevel"] = self.get_gpu_level()
+        self.PropertiesChanged(interface, changed, [])
+
+    @dbus.service.signal(dbus.PROPERTIES_IFACE, signature="sa{sv}as")
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass
+
+    @dbus.service.method(dbus.INTROSPECTABLE_IFACE, out_signature="s")
+    def Introspect(self):
+        access = lambda setter: "readwrite" if setter else "read"
+        sig = lambda v: {dbus.UInt32: "u", dbus.Int32: "i", dbus.String: "s", dbus.Array: "as"}[type(v)]
+        out = ['<node>',
+               '<interface name="org.freedesktop.DBus.Properties">'
+               '<method name="Get"><arg direction="in" type="s"/><arg direction="in" type="s"/><arg direction="out" type="v"/></method>'
+               '<method name="GetAll"><arg direction="in" type="s"/><arg direction="out" type="a{sv}"/></method>'
+               '<method name="Set"><arg direction="in" type="s"/><arg direction="in" type="s"/><arg direction="in" type="v"/></method>'
+               '<signal name="PropertiesChanged"><arg type="s"/><arg type="a{sv}"/><arg type="as"/></signal>'
+               '</interface>']
+        for interface, props in self.table().items():
+            out.append(f'<interface name="{interface}">')
+            for name, (get, setter) in props.items():
+                out.append(f'<property name="{name}" type="{sig(get())}" access="{access(setter)}"/>')
+            out.append('</interface>')
+        out.append('</node>')
+        return "".join(out)
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    name = dbus.service.BusName(BUS_NAME, bus)       # noqa: F841 (held for the life of the process)
+    Controls(bus)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

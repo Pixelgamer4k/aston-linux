@@ -1,0 +1,310 @@
+#!/bin/busybox sh
+# Slot A pid 1. Mount the linux partition and start the system on it.
+# The LineageOS vendor ramdisk has already been merged in, so
+# /lib/modules is the matching module set for this kernel.
+
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+# Kernels built with devtmpfs get real device nodes from the kernel; the
+# original LineageOS kernel has none, so fall back to a tmpfs filled by mdev.
+if ! mount -t devtmpfs -o mode=755,nosuid devtmpfs /dev 2>/dev/null; then
+    mount -t tmpfs -o mode=755,nosuid tmpfs /dev
+    mknod -m 600 /dev/kmsg c 1 11
+    mknod -m 600 /dev/console c 5 1
+    mknod -m 666 /dev/null c 1 3
+fi
+mkdir -p /dev/pts /dev/block /mnt /tmp /config /run
+
+LOG=/tmp/boot.log
+: > "$LOG"
+log() {
+    printf '%s\n' "$*" >> "$LOG"
+    for kmsg in /dev/kmsg /mnt/dev/kmsg; do
+        if [ -c "$kmsg" ]; then
+            printf 'aston-linux: %.900s\n' "$*" > "$kmsg"
+        fi
+    done
+}
+
+# pid 1 must never exit, or the kernel panics into crash-dump mode.
+fail() {
+    log "FAIL: $*"
+    if [ -d /mnt/var/log ]; then
+        cp "$LOG" /mnt/var/log/aston-boot.log
+        dmesg > /mnt/var/log/aston-dmesg.log 2>/dev/null
+    fi
+    sync
+    sleep 3
+    /bin/reboot2 bootloader
+    while :; do sleep 60; done
+}
+
+CONFIGFS=0
+LOADED=" "
+# qcom-dload-mode turns every panic into a crash dump that needs a key combo to leave.
+SKIP=" qcom-dload-mode "
+log "pid1"
+
+load_mod() {
+    local name line deps dpath base dep err
+    name="$1"
+    case "$LOADED$SKIP" in
+        *" $name "*) return 0 ;;
+    esac
+    LOADED="$LOADED$name "
+    line=""
+    while IFS= read -r dep; do
+        case "$dep" in
+            "/lib/modules/$name.ko:"*) line=$dep; break ;;
+        esac
+    done < /lib/modules/modules.dep
+    if [ -n "$line" ]; then
+        deps=${line#*:}
+        # modules.dep lists the deepest dependency last.
+        for dpath in $(for d in $deps; do echo "$d"; done | tac); do
+            base=${dpath##*/}
+            base=${base%.ko}
+            load_mod "$base"
+        done
+    fi
+    if [ ! -f "/lib/modules/$name.ko" ]; then
+        log "missing $name"
+        return 0
+    fi
+    if insmod "/lib/modules/$name.ko" 2>/tmp/insmod.err; then
+        log "ok $name"
+    else
+        err=$(cat /tmp/insmod.err 2>/dev/null)
+        case "$err" in
+            *exist*|*Exist*) log "already $name" ;;
+            *) log "fail $name $err" ;;
+        esac
+    fi
+}
+
+load_list() {
+    while IFS= read -r mod; do
+        mod=${mod%.ko}
+        mod=${mod%%#*}
+        [ -n "$mod" ] || continue
+        load_mod "$mod"
+    done < "$1"
+}
+
+if [ -f /lib/modules/modules.load ]; then
+    load_list /lib/modules/modules.load
+else
+    log "no modules.load"
+fi
+
+ROOTDEV=""
+i=0
+while [ "$i" -lt 30 ]; do
+    mdev -s
+    for ue in /sys/class/block/*/uevent; do
+        dev=""
+        part=""
+        while IFS= read -r kv; do
+            case "$kv" in
+                DEVNAME=*) dev=${kv#DEVNAME=} ;;
+                PARTNAME=*) part=${kv#PARTNAME=} ;;
+            esac
+        done < "$ue"
+        if [ "$part" = "linux" ] && [ -b "/dev/$dev" ]; then
+            ROOTDEV="/dev/$dev"
+        fi
+    done
+    [ -n "$ROOTDEV" ] && break
+    i=$((i + 1))
+    sleep 1
+done
+
+[ -n "$ROOTDEV" ] || fail "linux partition not found"
+
+log "root $ROOTDEV"
+mount -t ext4 -o rw,noatime "$ROOTDEV" /mnt || fail "mount $ROOTDEV failed"
+
+# The partition can hold more than one system. /boot-target names the one to
+# start: "steamos" boots the tree in /steamos, anything else boots the
+# partition root (Debian). The whole partition stays reachable at /run/part.
+TARGET=$(cat /mnt/boot-target 2>/dev/null)
+if [ "$TARGET" = steamos ] && [ -x /mnt/steamos/usr/lib/systemd/systemd ]; then
+    mkdir -p /part
+    mount --move /mnt /part
+    mount --bind /part/steamos /mnt || fail "bind steamos root failed"
+    log "target steamos"
+else
+    TARGET=debian
+    log "target debian"
+fi
+
+# Debian uses merged /usr: /lib, /bin and /sbin must stay symlinks into /usr.
+for d in lib bin sbin; do
+    if [ -d "/mnt/usr/$d" ] && [ -d "/mnt/$d" ] && [ ! -L "/mnt/$d" ]; then
+        log "repairing /$d (real dir instead of usr/$d symlink)"
+        cp -a "/mnt/$d/." "/mnt/usr/$d/" && rm -rf "/mnt/$d" && ln -s "usr/$d" "/mnt/$d"
+        sync
+    fi
+done
+
+# Tell the OnePlus boot watchdog that boot finished, or it forces a reboot at 240 s.
+if [ -w /proc/phoenix ]; then
+    echo ANDROID_BOOT_COMPLETED > /proc/phoenix
+    log "phoenix told boot completed"
+fi
+
+mkdir -p /mnt/var/log /mnt/proc /mnt/sys /mnt/dev /mnt/run /mnt/tmp /mnt/config
+chmod 1777 /mnt/tmp
+cp "$LOG" /mnt/var/log/aston-boot.log
+sync
+
+# USB gadget. The bootloader names this controller in bootconfig.
+for extra in phy-msm-m31-eusb2 phy-msm-snps-eusb2 phy-msm-ssusb-qmp \
+    repeater-i2c-eusb2 repeater-qti-pmic-eusb2 eud sps_drv usb_bam dwc3-msm; do
+    load_mod "$extra"
+done
+# The rest of the recovery set is what gives LineageOS recovery a working USB port.
+if [ -f /lib/modules/modules.load.recovery ]; then
+    load_list /lib/modules/modules.load.recovery
+fi
+
+# dwc3-msm only creates the UDC once something selects the role, as LineageOS recovery does.
+SSUSB=/sys/bus/platform/devices/a600000.ssusb
+k=0
+while [ ! -e "$SSUSB/mode" ] && [ "$k" -lt 30 ]; do
+    k=$((k + 1))
+    sleep 1
+done
+if [ -e "$SSUSB/mode" ]; then
+    echo peripheral > "$SSUSB/mode" && log "ssusb mode peripheral"
+else
+    log "no $SSUSB/mode"
+fi
+
+if mount -t configfs none /config; then
+    CONFIGFS=1
+else
+    log "configfs mount failed"
+fi
+
+UDC=""
+j=0
+while [ "$j" -lt 15 ]; do
+    for u in /sys/class/udc/*; do
+        [ -e "$u" ] || continue
+        UDC=$(basename "$u")
+        break
+    done
+    [ -n "$UDC" ] && break
+    j=$((j + 1))
+    sleep 1
+done
+
+IFACE=""
+if [ -n "$UDC" ] && [ "$CONFIGFS" = 1 ]; then
+    log "udc $UDC"
+    G=/config/usb_gadget/g1
+    mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409" "$G/functions/ecm.usb0"
+    echo 0x0525 > "$G/idVendor"
+    echo 0xa4a1 > "$G/idProduct"
+    echo 0x0200 > "$G/bcdUSB"
+    echo 0x0100 > "$G/bcdDevice"
+    echo aston > "$G/strings/0x409/serialnumber"
+    echo debian > "$G/strings/0x409/manufacturer"
+    echo aston > "$G/strings/0x409/product"
+    echo ecm > "$G/configs/c.1/strings/0x409/configuration"
+    echo 250 > "$G/configs/c.1/MaxPower"
+    ln -s "$G/functions/ecm.usb0" "$G/configs/c.1/ecm.usb0"
+    echo "$UDC" > "$G/UDC" || log "udc bind failed"
+    sleep 1
+    for n in /sys/class/net/usb* /sys/class/net/ncm*; do
+        [ -e "$n" ] || continue
+        base=$(basename "$n")
+        IFACE=$base
+        ifconfig "$base" 169.254.42.1 netmask 255.255.0.0 up
+        log "addr $base 169.254.42.1"
+    done
+    [ -n "$IFACE" ] || log "no usb interface: $(ls /sys/class/net | tr '\n' ' ')"
+else
+    log "no udc"
+fi
+
+# Keep SSH available even if systemd stops early.
+mkdir -p /mnt/etc/ssh
+if ! grep -q 'aston-linux' /mnt/etc/ssh/sshd_config 2>/dev/null; then
+    cat >> /mnt/etc/ssh/sshd_config << 'EOF'
+# aston-linux
+UsePAM no
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
+fi
+mkdir -p /mnt/etc/systemd/system/sysinit.target.wants
+cat > /mnt/etc/systemd/system/usb-addr.service << 'EOF'
+[Unit]
+Description=Restore USB gadget address
+DefaultDependencies=no
+After=local-fs.target
+Before=network.target ssh.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for n in /sys/class/net/usb* /sys/class/net/ncm*; do [ -e "$n" ] || continue; b=${n##*/}; /usr/sbin/ip link set "$b" up; /usr/sbin/ip addr replace 169.254.42.1/16 dev "$b"; done'
+[Install]
+WantedBy=sysinit.target
+EOF
+ln -sf /etc/systemd/system/usb-addr.service /mnt/etc/systemd/system/sysinit.target.wants/usb-addr.service
+mkdir -p /mnt/etc/systemd/system/ssh.service.d
+cat > /mnt/etc/systemd/system/ssh.service.d/aston.conf << 'EOF'
+[Service]
+RuntimeDirectoryPreserve=yes
+EOF
+
+# Debian keeps using busybox mdev for new device nodes.
+mkdir -p /mnt/usr/local/sbin
+cp /bin/busybox /mnt/usr/local/sbin/busybox
+ln -sf busybox /mnt/usr/local/sbin/mdev
+cp /bin/reboot2 /mnt/usr/local/sbin/reboot2
+
+mdev -s
+chmod 666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty /dev/ptmx 2>/dev/null
+ln -sf /proc/self/fd /dev/fd
+ln -sf /proc/self/fd/0 /dev/stdin
+ln -sf /proc/self/fd/1 /dev/stdout
+ln -sf /proc/self/fd/2 /dev/stderr
+mkdir -p /dev/shm
+dmesg > /mnt/var/log/aston-dmesg.log 2>/dev/null
+
+mount --move /proc /mnt/proc
+mount --move /sys /mnt/sys
+mount --move /dev /mnt/dev
+mount -t devpts -o gid=5,mode=620,ptmxmode=666 devpts /mnt/dev/pts
+mount -t tmpfs -o mode=755,nosuid,nodev tmpfs /mnt/run
+mkdir -p -m 755 /mnt/run/sshd /mnt/run/lock
+if [ -d /part ]; then
+    mkdir -p /mnt/run/part
+    mount --move /part /mnt/run/part
+fi
+if [ "$CONFIGFS" = 1 ]; then
+    mount --move /config /mnt/config
+fi
+[ -e /mnt/proc/sys/kernel/hotplug ] && echo /usr/local/sbin/mdev > /mnt/proc/sys/kernel/hotplug
+
+# Port 22 belongs to Debian's ssh.service. If that unit fails, systemd deletes
+# /run/sshd, so this fallback keeps its own privsep directory alive on 2222.
+if chroot /mnt /usr/sbin/sshd -p 2222 -E /var/log/aston-sshd.log \
+    -o UsePAM=no -o PermitRootLogin=yes -o PidFile=/run/aston-sshd.pid; then
+    log "fallback sshd started on 2222"
+    chroot /mnt /bin/sh -c 'while :; do mkdir -p -m 755 /run/sshd; sleep 5; done' </dev/null >/dev/null 2>&1 &
+else
+    log "sshd failed"
+fi
+cp "$LOG" /mnt/var/log/aston-boot.log
+sync
+
+log "switch_root"
+[ -x /mnt/sbin/init ] || [ -L /mnt/sbin/init ] || fail "no /sbin/init in $TARGET root"
+exec switch_root /mnt /sbin/init

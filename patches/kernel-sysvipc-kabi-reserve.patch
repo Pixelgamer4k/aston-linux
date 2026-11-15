@@ -1,0 +1,43 @@
+Enable CONFIG_SYSVIPC on the LineageOS SM8550 kernel without changing the
+KABI that the prebuilt vendor modules were built against.
+
+Base: LineageOS/android_kernel_oneplus_sm8550 @ 3caf896e6bc8 (5.15.211)
+
+struct task_struct gains sysvsem (8 bytes) and sysvshm (16 bytes) when
+CONFIG_SYSVIPC=y, which changes its layout and therefore the CRC of every
+exported symbol that touches it, so none of the 721 vendor modules would
+load.  This moves both fields into the ANDROID_KABI_RESERVE(2..4) padding
+at the end of the struct (3 x u64 = 24 bytes) and hides them from genksyms,
+so size, offsets of all other members and symbol CRCs stay identical.
+
+Reconstructed from the edit that was applied during the port (the build VM
+no longer exists); apply by hand if the context differs.  Verify afterwards
+by comparing every module's __versions table against the new Module.symvers.
+
+Then: scripts/config -e SYSVIPC -e POSIX_MQUEUE && make olddefconfig
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ struct task_struct {
+-#ifdef CONFIG_SYSVIPC
+-	struct sysv_sem			sysvsem;
+-	struct sysv_shm			sysvshm;
+-#endif
++	/*
++	 * aston: sysvsem/sysvshm live in reserved KABI slots at the end of this
++	 * struct (see below), so that enabling CONFIG_SYSVIPC changes neither the
++	 * layout nor the symbol CRCs that prebuilt vendor modules were built against.
++	 */
+@@ struct task_struct {
+-	ANDROID_KABI_RESERVE(2);
+-	ANDROID_KABI_RESERVE(3);
+-	ANDROID_KABI_RESERVE(4);
++#if defined(CONFIG_SYSVIPC) && !defined(__GENKSYMS__)
++	struct sysv_sem			sysvsem;	/* 8 bytes: slot 2 */
++	struct sysv_shm			sysvshm;	/* 16 bytes: slots 3 and 4 */
++#else
++	ANDROID_KABI_RESERVE(2);
++	ANDROID_KABI_RESERVE(3);
++	ANDROID_KABI_RESERVE(4);
++#endif
+ 	ANDROID_KABI_RESERVE(5);

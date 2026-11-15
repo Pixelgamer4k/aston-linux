@@ -1,0 +1,8 @@
+#!/bin/sh
+# Power-limit slider for Desktop Mode: pick a whole-phone wattage, 0 turns the limit off.
+now=$(aston power 2>/dev/null)
+cur=$(sed -n 's/^TDP_WATTS=\([0-9]*\).*/\1/p' /etc/aston/power.conf)
+v=$(kdialog --title "Power limit" --slider "Power limit on battery, in watts (0 = no limit)
+Current setting: ${cur:-0} W
+$now" 0 12 1) || exit 0
+kdialog --title "Power limit" --passivepopup "$(sudo aston tdp "$v")" 4

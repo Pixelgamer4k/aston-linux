@@ -1,0 +1,12 @@
+#!/bin/sh
+# ssh into SteamOS on the phone: USB link first, then Wi-Fi, then the boot-time fallback port.
+d=$(dirname "$0")
+o="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -i $d/../keys/aston_ed25519"
+# Set ASTON_WIFI_IP to the phone's Wi-Fi address to enable the Wi-Fi fallback.
+for t in "169.254.42.1 22" ${ASTON_WIFI_IP:+"$ASTON_WIFI_IP 22"} "169.254.42.1 2222"; do
+    set -- $t "$@"; h=$1; p=$2; shift 2
+    if ssh $o -o ConnectTimeout=6 -p $p root@$h true </dev/null 2>/dev/null; then
+        exec ssh $o -o ConnectTimeout=6 -p $p root@$h "$@"
+    fi
+done
+echo "phone not reachable" >&2; exit 255

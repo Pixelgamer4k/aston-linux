@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Vibrate the phone through the kernel's force-feedback interface.
+
+The motor is driven by the PMIC's high-voltage haptics block. It can do a plain
+buzz, or play the short shaped waveforms OnePlus defines for the phone (the
+crisp "click" style feedback Android uses).
+
+Usage: aston-buzz [MILLISECONDS] [STRENGTH 0-100]     plain buzz
+       aston-buzz click|double|tick|thud|pop|heavy [STRENGTH 0-100]
+       aston-buzz effect N [STRENGTH]                 predefined effect by number
+"""
+import ctypes, fcntl, glob, os, struct, sys, time
+
+EFFECTS = {"click": 0, "double": 1, "tick": 2, "thud": 3, "pop": 4, "heavy": 5}
+EV_FF, FF_PERIODIC, FF_CONSTANT, FF_CUSTOM, FF_GAIN = 0x15, 0x51, 0x52, 0x5D, 0x60
+EVIOCSFF = 0x40304580       # _IOW('E', 0x80, struct ff_effect), 48 bytes on arm64
+EVIOCRMFF = 0x40044581
+
+args = sys.argv[1:]
+effect_no = None
+if args and args[0] in EFFECTS:
+    effect_no = EFFECTS[args.pop(0)]
+elif args and args[0] == "effect":
+    effect_no = int(args[1]); args = args[2:]
+if effect_no is None:
+    ms = int(args[0]) if args else 300
+    strength = int(args[1]) if len(args) > 1 else 100
+else:
+    ms = 0
+    strength = int(args[0]) if args else 100
+
+dev = None
+for name in glob.glob("/sys/class/input/event*/device/name"):
+    if open(name).read().strip() == "qcom-hv-haptics":
+        dev = "/dev/input/" + name.split("/")[4]
+if not dev:
+    sys.exit("haptics device not found")
+
+def event(code, value):
+    return struct.pack("<qqHHi", 0, 0, EV_FF, code, value)
+
+fd = os.open(dev, os.O_RDWR)
+os.write(fd, event(FF_GAIN, 0xFFFF * strength // 100))
+level = 0x7FFF * strength // 100
+if effect_no is None:
+    # constant: level, envelope x4
+    effect = bytearray(struct.pack("<HhH HH HH H h HHHH 22x", FF_CONSTANT, -1, 0, 0, 0, ms, 0, 0, level, 0, 0, 0, 0))
+    fcntl.ioctl(fd, EVIOCSFF, effect)
+else:
+    # periodic/custom: the driver looks up custom_data[0] as the effect number
+    # and writes the waveform's play time back into custom_data[1] (s) and [2] (ms).
+    custom = (ctypes.c_int16 * 3)(effect_no, 0, 0)
+    effect = bytearray(struct.pack("<HhH HH HH H HHhhH HHHH 2x I Q", FF_PERIODIC, -1, 0, 0, 0, 0, 0, 0,
+                                   FF_CUSTOM, 0, level, 0, 0, 0, 0, 0, 0, 6, ctypes.addressof(custom)))
+    fcntl.ioctl(fd, EVIOCSFF, effect)
+    ms = custom[1] * 1000 + custom[2]
+effect_id = struct.unpack_from("<h", effect, 2)[0]
+os.write(fd, event(effect_id, 1))
+time.sleep(max(ms, 20) / 1000 + 0.05)
+os.write(fd, event(effect_id, 0))
+fcntl.ioctl(fd, EVIOCRMFF, effect_id)
+os.close(fd)
+what = "buzz" if effect_no is None else "effect %d" % effect_no
+print("played %s, %d ms at %d%%" % (what, ms, strength))

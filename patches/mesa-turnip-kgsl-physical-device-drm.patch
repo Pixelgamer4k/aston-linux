@@ -1,0 +1,54 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index efbf83b..a5c6239 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -371,7 +371,7 @@ get_device_extensions(const struct tu_physical_device *device,
+       .EXT_mutable_descriptor_type = true,
+       .EXT_nested_command_buffer = true,
+       .EXT_non_seamless_cube_map = true,
+-      .EXT_physical_device_drm = !is_kgsl(device->instance),
++      .EXT_physical_device_drm = !is_kgsl(device->instance) || device->has_master || device->has_local,
+       .EXT_pipeline_creation_cache_control = true,
+       .EXT_pipeline_creation_feedback = true,
+ #ifdef TU_USE_WSI_PLATFORM
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index e12798f..6f93707 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include <errno.h>
++#include <sys/stat.h>
++#include <sys/sysmacros.h>
+ #include <fcntl.h>
+ #include <linux/dma-heap.h>
+ #include <poll.h>
+@@ -1964,6 +1966,27 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
+    device->instance = instance;
+    device->master_fd = -1;
+    device->local_fd = fd;
++
++   /* aston: KGSL is not a DRM device, so there is nothing to report through
++    * VK_EXT_physical_device_drm.  Compositors such as gamescope use that
++    * extension to learn which DRM node presents this GPU's buffers and refuse
++    * to accept client frames without it.  On these Qualcomm kernels scanout
++    * is the separate msm_drm (SDE) device, which imports the dma-bufs this
++    * driver exports, so report that device as the associated DRM node.
++    */
++   {
++      struct stat drm_st;
++      if (stat("/dev/dri/card0", &drm_st) == 0) {
++         device->has_master = true;
++         device->master_major = major(drm_st.st_rdev);
++         device->master_minor = minor(drm_st.st_rdev);
++      }
++      if (stat("/dev/dri/renderD128", &drm_st) == 0) {
++         device->has_local = true;
++         device->local_major = major(drm_st.st_rdev);
++         device->local_minor = minor(drm_st.st_rdev);
++      }
++   }
+    device->kgsl_dma_fd = dma_fd;
+ 
+    device->dev_id.gpu_id =

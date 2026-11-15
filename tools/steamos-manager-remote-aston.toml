@@ -1,0 +1,17 @@
+# Controls SteamOS Manager has no built-in support for on this phone are
+# supplied by aston-steamosd.
+[TdpLimit1]
+bus_name = "com.aston.SteamOS"
+object_path = "/com/aston/SteamOS"
+
+[BatteryChargeLimit1]
+bus_name = "com.aston.SteamOS"
+object_path = "/com/aston/SteamOS"
+
+[GpuPerformanceLevel1]
+bus_name = "com.aston.SteamOS"
+object_path = "/com/aston/SteamOS"
+
+[PerformanceProfile1]
+bus_name = "com.aston.SteamOS"
+object_path = "/com/aston/SteamOS"

@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Hardware-button shortcuts for Gaming Mode on the OnePlus 12R.
+
+  Volume Up + Volume Down together -> Steam's Quick Access menu
+
+The phone has no controller buttons of its own, so the combination is turned
+into the keyboard shortcut Steam already listens for (Ctrl+2), typed on a
+virtual keyboard. Only active while the session mode is "game".
+"""
+import fcntl
+import glob
+import os
+import select
+import struct
+import time
+
+EV_SYN, EV_KEY = 0, 1
+KEY_2, KEY_LEFTCTRL, KEY_VOLUMEDOWN, KEY_VOLUMEUP = 3, 29, 114, 115
+UI_DEV_CREATE, UI_DEV_SETUP = 0x5501, 0x405c5503
+UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
+EVENT = struct.Struct("qqHHi")
+BUTTON_DEVICES = ("gpio-keys", "pmic_resin", "pmic_pwrkey")
+COMBO_WINDOW = 0.35             # seconds between the two presses to count as "together"
+
+
+def virtual_keyboard():
+    fd = os.open("/dev/uinput", os.O_WRONLY)
+    fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+    for key in (KEY_LEFTCTRL, KEY_2):
+        fcntl.ioctl(fd, UI_SET_KEYBIT, key)
+    fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack("HHHH80sI", 0x06, 0x1209, 0xa570, 1, b"aston-shortcuts", 0))
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    return fd
+
+
+def emit(fd, code, value):
+    os.write(fd, EVENT.pack(0, 0, EV_KEY, code, value) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+
+
+def chord(fd, modifier, key):
+    emit(fd, modifier, 1)
+    time.sleep(0.02)
+    emit(fd, key, 1)
+    time.sleep(0.04)
+    emit(fd, key, 0)
+    emit(fd, modifier, 0)
+
+
+def button_devices():
+    fds = []
+    for name_file in glob.glob("/sys/class/input/event*/device/name"):
+        try:
+            if open(name_file).read().strip() in BUTTON_DEVICES:
+                fds.append(os.open("/dev/input/" + name_file.split("/")[4], os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+    return fds
+
+
+def game_mode():
+    try:
+        return open("/etc/aston/session").read().strip() == "game"
+    except OSError:
+        return False
+
+
+def main():
+    keyboard = virtual_keyboard()
+    devices = button_devices()
+    if not devices:
+        raise SystemExit("no volume button devices found")
+    pressed_at = {KEY_VOLUMEUP: None, KEY_VOLUMEDOWN: None}
+    fired = False
+    while True:
+        readable, _, _ = select.select(devices, [], [])
+        for fd in readable:
+            try:
+                data = os.read(fd, EVENT.size * 16)
+            except OSError:
+                continue
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, etype, code, value = EVENT.unpack_from(data, off)
+                if etype != EV_KEY or code not in pressed_at or value == 2:
+                    continue
+                pressed_at[code] = time.monotonic() if value else None
+                up, down = pressed_at[KEY_VOLUMEUP], pressed_at[KEY_VOLUMEDOWN]
+                if up is None or down is None:
+                    fired = False
+                elif not fired and abs(up - down) <= COMBO_WINDOW:
+                    fired = True
+                    if game_mode():
+                        chord(keyboard, KEY_LEFTCTRL, KEY_2)
+
+
+if __name__ == "__main__":
+    main()

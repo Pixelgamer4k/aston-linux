@@ -1,0 +1,17 @@
+#!/bin/bash
+# aston: SteamOS switches between Gaming Mode and Desktop Mode through its
+# login manager, which cannot run on this phone (no virtual terminals). Here
+# the choice is stored in /etc/aston/session and the panel session restarted:
+#   gamescope  Gaming Mode: Gamescope + the Steam interface
+#   plasma     Desktop Mode: KDE Plasma
+session="${1:-gamescope}"
+case "$session" in
+  plasma|plasma-persistent|plasma-wayland-persistent|desktop) mode=desktop ;;
+  gamescope|game) mode=game ;;
+  *) echo >&2 "!! Unrecognized session '$session'"; exit 1 ;;
+esac
+echo "$mode" | sudo -n tee /etc/aston/session >/dev/null || exit 1
+# An explicit choice replaces any one-time choice Steam left behind.
+sudo -n rm -f /etc/sddm.conf.d/zzt-steamos-temp-login.conf
+# Not waited for: this script is part of the session being restarted.
+exec sudo -n systemctl restart --no-block aston-session

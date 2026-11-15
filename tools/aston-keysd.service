@@ -1,0 +1,10 @@
+[Unit]
+Description=Hardware-button shortcuts for Gaming Mode (both volume keys: Quick Access menu)
+
+[Service]
+ExecStart=/usr/local/sbin/aston-keysd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

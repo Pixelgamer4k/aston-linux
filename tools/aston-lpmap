@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Map a logical partition from Android's "super" partition, read-only.
+
+Android keeps system/vendor/odm inside one big partition with its own
+partition table (liblp).  This reads that table and creates a read-only
+device-mapper device for one logical partition so its files can be copied.
+
+Usage: aston-lpmap list
+       aston-lpmap map NAME      -> /dev/mapper/lp-NAME (read-only)
+       aston-lpmap unmap NAME
+"""
+import struct
+import subprocess
+import sys
+
+SUPER = "/dev/disk/by-partlabel/super"
+
+
+def table():
+    with open(SUPER, "rb") as f:
+        f.seek(4096)
+        magic, _size = struct.unpack("<II", f.read(8))
+        if magic != 0x616C4467:
+            sys.exit("super: no liblp geometry")
+        f.seek(4096 + 8 + 32)
+        f.read(12)
+        f.seek(4096 * 3)
+        hdr = f.read(256)
+        if struct.unpack_from("<I", hdr, 0)[0] != 0x414C5030:
+            sys.exit("super: no liblp metadata header")
+        header_size = struct.unpack_from("<I", hdr, 8)[0]
+        tables_size = struct.unpack_from("<I", hdr, 44)[0]
+        p_off, p_num, p_size = struct.unpack_from("<III", hdr, 80)
+        e_off, e_num, e_size = struct.unpack_from("<III", hdr, 92)
+        f.seek(4096 * 3 + header_size)
+        t = f.read(tables_size)
+    extents = [struct.unpack_from("<QIQI", t, e_off + i * e_size) for i in range(e_num)]
+    parts = {}
+    for i in range(p_num):
+        raw = t[p_off + i * p_size: p_off + (i + 1) * p_size]
+        name = raw[:36].split(b"\0")[0].decode()
+        _attr, first, num, _group = struct.unpack_from("<IIII", raw, 36)
+        parts[name] = extents[first:first + num]
+    return parts
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    parts = table()
+    if sys.argv[1] == "list":
+        for name, ext in sorted(parts.items()):
+            print("%-20s %8.1f MiB  %d extent(s)" % (name, sum(e[0] for e in ext) / 2048, len(ext)))
+    elif sys.argv[1] == "map" and len(sys.argv) == 3:
+        ext = parts.get(sys.argv[2])
+        if not ext:
+            sys.exit("%s: not found or empty" % sys.argv[2])
+        lines, start = [], 0
+        for sectors, kind, phys, _src in ext:
+            if kind != 0:
+                sys.exit("unsupported extent type %d" % kind)
+            lines.append("%d %d linear %s %d" % (start, sectors, SUPER, phys))
+            start += sectors
+        subprocess.run(["dmsetup", "create", "--readonly", "lp-" + sys.argv[2]], input="\n".join(lines) + "\n", text=True, check=True)
+        print("/dev/mapper/lp-" + sys.argv[2])
+    elif sys.argv[1] == "unmap" and len(sys.argv) == 3:
+        subprocess.run(["dmsetup", "remove", "lp-" + sys.argv[2]], check=True)
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

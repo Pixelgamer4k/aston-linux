@@ -1,0 +1,79 @@
+#!/bin/bash
+# aston-record: record Gaming Mode with the phone's hardware H.265 encoder.
+#
+#   aston-record start    begin recording (video + game audio)
+#   aston-record stop     finish and write ~/Videos/Recording-DATE.mp4
+#   aston-record toggle   start if idle, stop if recording
+#   aston-record status
+#
+# Settings: /etc/aston/record.conf (WIDTH, HEIGHT, FPS, BITRATE, CODEC).
+# Run as the session user; root is redirected to that user.
+if [ "$(id -u)" = 0 ]; then
+    exec sudo -u steamos env XDG_RUNTIME_DIR=/run/user/1000 "$0" "$@"
+fi
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+
+WIDTH=1920 HEIGHT=872 FPS=60 BITRATE=12000000 CODEC=hevc
+. /etc/aston/record.conf 2>/dev/null
+OUTDIR=${OUTDIR:-$HOME/Videos}
+RUN=$XDG_RUNTIME_DIR/aston-record
+mkdir -p "$OUTDIR" "$RUN"
+
+running() { [ -f "$RUN/video.pid" ] && kill -0 "$(cat "$RUN/video.pid")" 2>/dev/null; }
+buzz() { command -v aston-buzz >/dev/null && sudo -n aston-buzz "$1" < /dev/null > /dev/null 2>&1 & }
+
+start() {
+    if running; then echo "already recording"; return 0; fi
+    [ -e /dev/video33 ] || { echo "hardware encoder is not loaded (aston-video.service)"; return 1; }
+    name="Recording-$(date +%Y%m%d-%H%M%S)"
+    ext=h265; [ "$CODEC" = h264 ] && ext=h264
+    echo "$name" > "$RUN/name"
+    echo "$ext" > "$RUN/ext"
+    setsid aston-gamerec "$RUN/video.$ext" "$WIDTH" "$HEIGHT" "$FPS" "$BITRATE" "$CODEC" < /dev/null > /dev/null 2> "$RUN/video.log" &
+    echo $! > "$RUN/video.pid"
+    # Game audio: whatever is playing on the default output. A stream of
+    # silence keeps that output running, otherwise nothing at all is delivered
+    # while the game is quiet and the sound would end up out of step.
+    setsid pacat --raw --rate 48000 --channels 2 /dev/zero < /dev/null > /dev/null 2>&1 &
+    echo $! > "$RUN/silence.pid"
+    setsid ffmpeg -nostdin -v error -y -f pulse -i @DEFAULT_MONITOR@ -c:a aac -b:a 160k -flush_packets 1 -f adts "$RUN/audio.aac" < /dev/null > /dev/null 2> "$RUN/audio.log" &
+    echo $! > "$RUN/audio.pid"
+    sleep 1
+    if ! running; then echo "recording failed to start:"; cat "$RUN/video.log"; kill "$(cat "$RUN/audio.pid")" 2>/dev/null; return 1; fi
+    buzz click
+    echo "recording"
+}
+
+stop() {
+    if ! running; then echo "not recording"; return 0; fi
+    kill -TERM "$(cat "$RUN/video.pid")" "$(cat "$RUN/audio.pid")" 2>/dev/null
+    for i in $(seq 40); do
+        kill -0 "$(cat "$RUN/video.pid")" 2>/dev/null || kill -0 "$(cat "$RUN/audio.pid")" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$(cat "$RUN/audio.pid")" "$(cat "$RUN/video.pid")" "$(cat "$RUN/silence.pid" 2>/dev/null)" 2>/dev/null
+    name=$(cat "$RUN/name"); ext=$(cat "$RUN/ext")
+    out="$OUTDIR/$name.mp4"
+    tag=; [ "$ext" = h265 ] && tag="-tag:v hvc1"
+    audio=; [ -s "$RUN/audio.aac" ] && audio="-i $RUN/audio.aac -bsf:a aac_adtstoasc"
+    # The video is a constant-rate elementary stream; give it timestamps and add the audio, no re-encoding.
+    if ffmpeg -nostdin -v error -y -r "$FPS" -i "$RUN/video.$ext" $audio -c copy $tag -movflags +faststart -shortest "$out" 2> "$RUN/mux.log" \
+       || ffmpeg -nostdin -v error -y -r "$FPS" -i "$RUN/video.$ext" -c copy $tag -movflags +faststart "$out" 2>> "$RUN/mux.log"; then
+        rm -f "$RUN/video.$ext" "$RUN/audio.aac" "$RUN"/*.pid
+        buzz double
+        echo "$out"
+    else
+        mv "$RUN/video.$ext" "$OUTDIR/$name.$ext"
+        rm -f "$RUN"/*.pid
+        echo "could not build the MP4 (see $RUN/mux.log); raw video kept as $OUTDIR/$name.$ext"
+        return 1
+    fi
+}
+
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    toggle) if running; then stop; else start; fi ;;
+    status) if running; then echo "recording $(cat "$RUN/name")"; else echo "idle"; fi ;;
+    *) echo "usage: aston-record start|stop|toggle|status"; exit 1 ;;
+esac

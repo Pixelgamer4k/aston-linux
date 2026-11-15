@@ -1,0 +1,12 @@
+[Unit]
+Description=Hardware video encoder/decoder driver (msm_vidc)
+After=aston-gpu.service
+ConditionPathExists=/lib/firmware/vpu30_4v.mbn
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'grep -q "^msm_video " /proc/modules || insmod /usr/lib/modules/vendor_dlkm/msm_video.ko'
+
+[Install]
+WantedBy=multi-user.target
